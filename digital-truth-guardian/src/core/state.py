@@ -257,6 +257,13 @@ class AgentState(TypedDict, total=False):
     processing_completed: str
     agent_trace: List[str]  # Track which agents processed
     error: Optional[str]
+    
+    # ===== Internal Routing =====
+    _next_action: str  # Routing action for graph edges
+    tool_strategy: str  # Tool selection strategy
+    tool_reasoning: str  # Reasoning for tool selection
+    _retrieval_done: bool  # Flag to track if retrieval completed
+    _search_done: bool  # Flag to track if web search completed
 
 
 def create_initial_state(query: str, session_id: Optional[str] = None) -> AgentState:
@@ -300,7 +307,12 @@ def create_initial_state(query: str, session_id: Optional[str] = None) -> AgentS
         processing_started=datetime.utcnow().isoformat(),
         processing_completed="",
         agent_trace=[],
-        error=None
+        error=None,
+        _next_action="retrieve",
+        tool_strategy="BOTH_SEQUENTIAL",
+        tool_reasoning="",
+        _retrieval_done=False,
+        _search_done=False
     )
 
 

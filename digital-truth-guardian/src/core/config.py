@@ -50,7 +50,7 @@ class Config(BaseSettings):
     
     # ==================== Embedding Settings ====================
     dense_embedding_model: str = Field(
-        default="models/text-embedding-004",
+        default="gemini-embedding-001",
         description="Google dense embedding model"
     )
     dense_embedding_dim: int = Field(
@@ -58,17 +58,17 @@ class Config(BaseSettings):
         description="Dense embedding vector dimension"
     )
     sparse_embedding_model: str = Field(
-        default="Qdrant/bm25",
+        default="prithivida/Splade_PP_en_v1",
         description="FastEmbed sparse model for keyword matching"
     )
     
     # ==================== LLM Settings ====================
     gemini_pro_model: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3-flash-preview",
         description="Gemini Pro model for deep reasoning (Critic)"
     )
     gemini_flash_model: str = Field(
-        default="gemini-2.0-flash-lite",
+        default="gemini-3-flash-preview",
         description="Gemini Flash model for speed (Planner, Archivist)"
     )
     llm_temperature: float = Field(

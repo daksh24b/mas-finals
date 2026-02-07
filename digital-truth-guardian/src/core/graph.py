@@ -97,32 +97,30 @@ class TruthGuardianGraph:
         # Entry point
         graph.set_entry_point("planner")
         
-        # Planner routes to different nodes based on intent/action
+        # Planner routes based on intent
         graph.add_conditional_edges(
             "planner",
             self._route_from_planner,
             {
                 "retrieve": "retriever",
-                "search": "executor",
-                "critique": "critic",
                 "respond": "respond",
                 "end": END
             }
         )
         
-        # Retriever always goes back to planner for routing decision
-        graph.add_edge("retriever", "planner")
+        # Retriever always goes to executor (web search)
+        graph.add_edge("retriever", "executor")
         
-        # Executor always goes back to planner
-        graph.add_edge("executor", "planner")
+        # Executor always goes to critic for evaluation
+        graph.add_edge("executor", "critic")
         
-        # Critic routes based on verdict/feedback
+        # Critic routes based on verdict/feedback (only point for loops)
         graph.add_conditional_edges(
             "critic",
             self._route_from_critic,
             {
                 "archivist": "archivist",
-                "planner": "planner",  # Feedback loop
+                "planner": "planner",  # Feedback loop (max 3)
                 "respond": "respond"
             }
         )
@@ -204,59 +202,67 @@ class TruthGuardianGraph:
     def _route_from_planner(
         self,
         state: AgentState
-    ) -> Literal["retrieve", "search", "critique", "respond", "end"]:
-        """Route from Planner based on intent and action."""
+    ) -> Literal["retrieve", "respond", "end"]:
+        """Route from Planner based on intent.
+        
+        Sequential flow: Planner -> Retriever -> Executor -> Critic
+        Loops only happen from Critic back to Planner.
+        """
         intent = state.get("intent", "")
         
         # Handle non-informational intents
         if intent == Intent.CONVERSATIONAL.value:
+            logger.with_agent("Graph").info("Routing: conversational -> respond")
             return "respond"
         
         if intent == Intent.OUT_OF_SCOPE.value:
+            logger.with_agent("Graph").info("Routing: out_of_scope -> respond")
             return "respond"
         
-        # Get routing action from planner
-        action = state.get("_next_action", "retrieve")
-        
-        # Map actions to nodes
-        action_map = {
-            AgentAction.RETRIEVE.value: "retrieve",
-            AgentAction.SEARCH.value: "search",
-            AgentAction.CRITIQUE.value: "critique",
-            AgentAction.RESPOND.value: "respond",
-            AgentAction.END.value: "end",
-            AgentAction.LOOP_BACK.value: "retrieve"  # Default loop back to retrieve
-        }
-        
-        return action_map.get(action, "retrieve")
+        # For informational queries, always start with retrieval
+        logger.with_agent("Graph").info("Routing: informational -> retrieve")
+        return "retrieve"
     
     def _route_from_critic(
         self,
         state: AgentState
     ) -> Literal["archivist", "planner", "respond"]:
-        """Route from Critic based on verdict and feedback."""
+        """Route from Critic based on verdict and feedback.
+        
+        This is the ONLY point where loops can occur.
+        Max loops is enforced here.
+        """
         feedback = state.get("feedback", {})
         verdict = state.get("verdict", "PENDING")
+        loop_count = state.get("loop_count", 0)
+        max_loops = state.get("max_loops", 3)
         
-        # If evidence insufficient, trigger feedback loop
+        logger.with_agent("Graph").info(
+            f"Critic routing: verdict={verdict}, loop={loop_count}/{max_loops}, "
+            f"sufficient={feedback.get('is_sufficient', True)}"
+        )
+        
+        # If evidence insufficient, trigger feedback loop (max 3)
         if not feedback.get("is_sufficient", True):
-            if should_continue_loop(state):
+            if loop_count < max_loops:
                 logger.with_agent("Graph").info(
-                    "Critic feedback loop: evidence insufficient"
+                    f"Critic feedback loop {loop_count + 1}/{max_loops}: evidence insufficient"
                 )
                 return "planner"
             else:
                 # Max loops reached, proceed anyway
                 logger.with_agent("Graph").warning(
-                    "Max loops reached, proceeding to response"
+                    f"Max loops ({max_loops}) reached, proceeding to response"
                 )
                 return "respond"
         
         # If verdict is conclusive, go to archivist
         if verdict in [Verdict.TRUE.value, Verdict.FALSE.value]:
+            logger.with_agent("Graph").info(f"Verdict {verdict} -> archivist")
             return "archivist"
         
         # Uncertain verdict, skip archiving
+        logger.with_agent("Graph").info("Uncertain verdict -> respond")
         return "respond"
     
     # ==================== Response Generation ====================

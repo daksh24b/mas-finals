@@ -11,7 +11,8 @@ Responsible for:
 import json
 from typing import Optional, Tuple
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from .base import BaseAgent
 from ..core.config import settings, ModelConfig
@@ -118,19 +119,13 @@ class CriticAgent(BaseAgent):
         """Initialize the Critic agent."""
         self.model_name = ModelConfig.CRITIC["model"]
         self.temperature = ModelConfig.CRITIC["temperature"]
+        self.max_tokens = ModelConfig.CRITIC["max_tokens"]
         
-        # Configure Gemini
+        # Configure Gemini client
         if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config={
-                    "temperature": self.temperature,
-                    "max_output_tokens": ModelConfig.CRITIC["max_tokens"]
-                }
-            )
+            self.client = genai.Client(api_key=settings.gemini_api_key)
         else:
-            self.model = None
+            self.client = None
             logger.with_agent(self.name).warning(
                 "Gemini API key not configured"
             )
@@ -143,6 +138,7 @@ class CriticAgent(BaseAgent):
         1. Check if evidence is sufficient
         2. If insufficient, generate feedback for Planner
         3. If sufficient, perform entailment check and determine verdict
+        4. Record episode and share insights with other agents
         """
         state = add_agent_to_trace(state, self.name)
         
@@ -172,6 +168,24 @@ class CriticAgent(BaseAgent):
             }
             state["verdict"] = Verdict.PENDING.value
             
+            # Record insufficient evidence episode
+            await self.record_episode(
+                state=state,
+                action_type="critique",
+                outcome="insufficient",
+                decision_reasoning=feedback.reason,
+                confidence=0.3,
+            )
+            
+            # Share warning with other agents
+            await self.write_shared_context(
+                content=f"Insufficient evidence for '{query[:50]}...': {feedback.reason}",
+                context_type="warning",
+                session_id=state.get("session_id"),
+                priority=3,
+                ttl_minutes=15,
+            )
+            
             logger.with_agent(self.name).info(
                 f"Evidence insufficient: {feedback.reason}"
             )
@@ -193,6 +207,25 @@ class CriticAgent(BaseAgent):
             "is_sufficient": True,
             "reason": "Evidence analyzed successfully"
         }
+        
+        # Record successful critique episode
+        await self.record_episode(
+            state=state,
+            action_type="critique",
+            outcome="success",
+            decision_reasoning=f"Verdict: {verdict.value}",
+            confidence=confidence,
+        )
+        
+        # Share insight about this verdict
+        await self.write_shared_context(
+            content=f"Verdict for '{query[:50]}...': {verdict.value} (confidence: {confidence:.2f})",
+            context_type="insight",
+            session_id=state.get("session_id"),
+            priority=2,
+            ttl_minutes=60,
+            tags=[verdict.value, "verdict"],
+        )
         
         logger.with_agent(self.name).info(
             f"Verdict: {verdict.value} ({format_confidence(confidence)})"
@@ -230,12 +263,29 @@ class CriticAgent(BaseAgent):
                 missing_info="External search needed"
             )
         
-        # Build evidence preview
+        # If we have trusted search results (tier 1-3), consider evidence sufficient
+        # and proceed to entailment check - let the LLM judge the content
+        trusted_results = [r for r in evidence.search_results if r.trust_tier <= 3]
+        if trusted_results:
+            logger.with_agent(self.name).info(
+                f"Found {len(trusted_results)} trusted sources - proceeding to verdict"
+            )
+            return True, None
+        
+        # If we have high-scoring KB docs, also sufficient
+        high_score_docs = [d for d in evidence.retrieved_docs if d.score >= 0.7]
+        if high_score_docs:
+            logger.with_agent(self.name).info(
+                f"Found {len(high_score_docs)} high-scoring KB docs - proceeding to verdict"
+            )
+            return True, None
+        
+        # Build evidence preview for LLM check (increased from 200 to 500 chars)
         preview_parts = []
         for doc in evidence.retrieved_docs[:2]:
-            preview_parts.append(f"[KB] {doc.text[:200]}...")
-        for result in evidence.search_results[:2]:
-            preview_parts.append(f"[Web: {result.domain}] {result.content[:200]}...")
+            preview_parts.append(f"[KB] {doc.text[:500]}...")
+        for result in evidence.search_results[:3]:
+            preview_parts.append(f"[Web: {result.domain}] {result.content[:500]}...")
         
         evidence_preview = "\n".join(preview_parts) if preview_parts else "No evidence"
         
@@ -274,8 +324,14 @@ class CriticAgent(BaseAgent):
             logger.with_agent(self.name).warning(
                 f"Failed to parse sufficiency check: {e}"
             )
-            # Default to sufficient if we have any evidence
-            return evidence.is_sufficient, None
+            # Default to sufficient if we have any evidence from trusted sources
+            if evidence.search_results or evidence.retrieved_docs:
+                return True, None
+            return False, FeedbackSignal(
+                is_sufficient=False,
+                reason="Unable to evaluate evidence",
+                suggested_action=AgentAction.SEARCH
+            )
     
     async def _entailment_check(
         self,
@@ -384,11 +440,18 @@ class CriticAgent(BaseAgent):
     
     async def _call_llm(self, prompt: str) -> str:
         """Call Gemini model with prompt."""
-        if not self.model:
+        if not self.client:
             return "{}"
         
         try:
-            response = await self.model.generate_content_async(prompt)
+            response = await self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_tokens,
+                )
+            )
             # Extract JSON from response
             text = response.text
             

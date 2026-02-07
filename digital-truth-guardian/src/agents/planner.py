@@ -11,7 +11,8 @@ Responsible for:
 import json
 from typing import List, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from langchain_core.messages import HumanMessage, AIMessage
 
 from .base import BaseAgent
@@ -106,6 +107,39 @@ Respond in JSON format:
 }}
 """
 
+TOOL_SELECTION_PROMPT = """You are a tool selection agent. Analyze the query and determine the best tool strategy.
+
+Query: {query}
+Query Type Analysis: {query_analysis}
+
+Available Tools:
+1. QDRANT_SEARCH - Internal knowledge base with verified facts
+   - Best for: Historical facts, previously verified claims, scientific facts
+   - Fast, high confidence when matched
+
+2. TAVILY_WEB_SEARCH - External web search with trusted source filtering
+   - Best for: Current events, recent news, real-time information
+   - Slower but access to fresh data
+
+3. BOTH_SEQUENTIAL - Qdrant first, then Tavily if insufficient
+   - Best for: General fact-checking where cached results may exist
+
+4. BOTH_PARALLEL - Query both simultaneously
+   - Best for: Time-sensitive queries needing comprehensive evidence
+
+Past Experiences with Similar Queries:
+{past_experiences}
+
+Based on the query type and past experiences, select the optimal tool strategy.
+
+Respond in JSON format:
+{{
+    "strategy": "<QDRANT_SEARCH|TAVILY_WEB_SEARCH|BOTH_SEQUENTIAL|BOTH_PARALLEL>",
+    "reasoning": "<explanation based on query type and past experiences>",
+    "confidence": <0.0-1.0>
+}}
+"""
+
 
 class PlannerAgent(BaseAgent):
     """
@@ -116,6 +150,8 @@ class PlannerAgent(BaseAgent):
     - Intent classification
     - Task decomposition
     - Feedback-driven routing
+    - Dynamic tool selection based on query type and past experiences
+    - Episodic memory for learning from past decisions
     """
     
     name = "Planner"
@@ -124,19 +160,13 @@ class PlannerAgent(BaseAgent):
         """Initialize the Planner agent."""
         self.model_name = ModelConfig.PLANNER["model"]
         self.temperature = ModelConfig.PLANNER["temperature"]
+        self.max_tokens = ModelConfig.PLANNER["max_tokens"]
         
-        # Configure Gemini
+        # Configure Gemini client
         if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config={
-                    "temperature": self.temperature,
-                    "max_output_tokens": ModelConfig.PLANNER["max_tokens"]
-                }
-            )
+            self.client = genai.Client(api_key=settings.gemini_api_key)
         else:
-            self.model = None
+            self.client = None
             logger.with_agent(self.name).warning(
                 "Gemini API key not configured"
             )
@@ -146,18 +176,41 @@ class PlannerAgent(BaseAgent):
         Process state and make routing decisions.
         
         Flow:
-        1. First call: Classify intent and decompose if needed
-        2. Subsequent calls: Route based on feedback
+        1. First call: Classify intent, select tools
+        2. Subsequent calls (feedback loops): Increment loop count and reprocess
         """
         state = add_agent_to_trace(state, self.name)
         
+        # Read any shared context from other agents
+        shared_context = await self.read_shared_context(
+            session_id=state.get("session_id"),
+            query=state.get("original_query"),
+            limit=3
+        )
+        if shared_context:
+            state["_shared_context"] = shared_context
+        
         # Check if this is first processing or a feedback loop
         if not state.get("intent"):
-            # First time: classify intent
-            return await self._classify_and_decompose(state)
+            # First time: classify intent and select tools
+            state = await self._classify_and_decompose(state)
+            state = await self._select_tools(state)
+            logger.with_agent(self.name).info("Initial classification complete")
+            return state
         else:
-            # Feedback loop: make routing decision
-            return await self._route(state)
+            # Feedback loop from Critic - increment loop count
+            state = increment_loop_count(state)
+            loop_count = state.get("loop_count", 0)
+            max_loops = state.get("max_loops", 3)
+            logger.with_agent(self.name).info(
+                f"Feedback loop iteration {loop_count}/{max_loops}"
+            )
+            
+            # Reset flags for new search attempt
+            state["_retrieval_done"] = False
+            state["_search_done"] = False
+            
+            return state
     
     async def _classify_and_decompose(self, state: AgentState) -> AgentState:
         """Classify intent and decompose multi-part queries."""
@@ -174,7 +227,9 @@ class PlannerAgent(BaseAgent):
         
         try:
             parsed = json.loads(intent_result)
-            intent = Intent(parsed["intent"].upper())
+            # Convert to lowercase to match enum values
+            intent_str = parsed["intent"].lower()
+            intent = Intent(intent_str)
             is_multi_part = parsed.get("is_multi_part", False)
             sub_queries = parsed.get("sub_queries", [])
         except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -249,11 +304,16 @@ class PlannerAgent(BaseAgent):
         try:
             parsed = json.loads(routing_result)
             action = AgentAction(parsed["action"].lower())
+            reasoning = parsed.get("reasoning", "")
         except (json.JSONDecodeError, KeyError, ValueError):
-            # Default routing logic
-            if retrieval_count == 0:
-                action = AgentAction.RETRIEVE
-            elif not search_triggered and retrieval_count < 2:
+            # Default routing logic when LLM fails
+            reasoning = "fallback logic"
+            if not search_triggered:
+                # Haven't searched yet, trigger external search
+                action = AgentAction.SEARCH
+            elif retrieval_count == 0:
+                action = AgentAction.SEARCH
+            elif retrieval_count < 2:
                 action = AgentAction.SEARCH
             else:
                 action = AgentAction.CRITIQUE
@@ -261,18 +321,143 @@ class PlannerAgent(BaseAgent):
         # Store routing decision in state
         state["_next_action"] = action.value
         
+        # Record this routing decision to episodic memory
+        await self.record_episode(
+            state=state,
+            action_type="route",
+            outcome="pending",  # Will be updated based on result
+            decision_reasoning=reasoning,
+            confidence=0.8,
+        )
+        
+        # Share routing context with other agents
+        await self.write_shared_context(
+            content=f"Routing to {action.value}: {reasoning}",
+            context_type="task_context",
+            session_id=state.get("session_id"),
+            priority=2,
+            ttl_minutes=10,
+        )
+        
         logger.with_agent(self.name).info(f"Routing decision: {action.value}")
         
         return state
     
+    async def _select_tools(self, state: AgentState) -> AgentState:
+        """
+        Dynamically select tools based on query analysis and past experiences.
+        
+        This is a key differentiator - tools are chosen based on:
+        1. Query characteristics (current events vs historical facts)
+        2. Past experiences with similar queries
+        """
+        query = state.get("original_query", "")
+        intent = state.get("intent", "")
+        
+        # Skip tool selection for non-informational queries
+        if intent not in [Intent.INFORMATIONAL.value]:
+            state["tool_strategy"] = "NONE"
+            return state
+        
+        # Recall past experiences with similar queries
+        past_episodes = await self.recall_similar_experiences(
+            query=query,
+            outcome_filter="success",  # Learn from successful outcomes
+            limit=3
+        )
+        
+        # Analyze query type
+        query_analysis = await self._analyze_query_type(query)
+        
+        # Format past experiences for prompt
+        past_exp_text = "No relevant past experiences."
+        if past_episodes:
+            past_exp_text = "\n".join([
+                f"- Query: '{ep.get('query', '')[:50]}...' | "
+                f"Action: {ep.get('action_type')} | "
+                f"Outcome: {ep.get('outcome')} | "
+                f"Tools: {ep.get('tools_used', [])}"
+                for ep in past_episodes
+            ])
+        
+        # Get tool selection from LLM
+        tool_result = await self._call_llm(
+            TOOL_SELECTION_PROMPT.format(
+                query=query,
+                query_analysis=query_analysis,
+                past_experiences=past_exp_text
+            )
+        )
+        
+        try:
+            parsed = json.loads(tool_result)
+            strategy = parsed.get("strategy", "BOTH_SEQUENTIAL")
+            reasoning = parsed.get("reasoning", "")
+        except (json.JSONDecodeError, KeyError):
+            strategy = "BOTH_SEQUENTIAL"
+            reasoning = "default strategy"
+        
+        state["tool_strategy"] = strategy
+        state["tool_reasoning"] = reasoning
+        
+        logger.with_agent(self.name).info(
+            f"Tool strategy: {strategy} ({reasoning[:50]}...)"
+        )
+        
+        return state
+    
+    async def _analyze_query_type(self, query: str) -> str:
+        """Analyze query to determine its type for tool selection."""
+        query_lower = query.lower()
+        
+        # Simple heuristics for query type
+        indicators = []
+        
+        # Current events indicators
+        if any(word in query_lower for word in ["today", "yesterday", "recent", "latest", "current", "now", "2026", "2025"]):
+            indicators.append("CURRENT_EVENTS")
+        
+        # Historical facts indicators
+        if any(word in query_lower for word in ["was", "were", "did", "history", "historical", "in 1", "in 2", "century"]):
+            indicators.append("HISTORICAL")
+        
+        # Scientific facts
+        if any(word in query_lower for word in ["scientific", "study", "research", "data", "statistics"]):
+            indicators.append("SCIENTIFIC")
+        
+        # Political/news
+        if any(word in query_lower for word in ["president", "election", "government", "policy", "politician"]):
+            indicators.append("POLITICAL")
+        
+        if not indicators:
+            indicators.append("GENERAL")
+        
+        return ", ".join(indicators)
+    
     async def _call_llm(self, prompt: str) -> str:
         """Call Gemini model with prompt."""
-        if not self.model:
+        if not self.client:
             return "{}"
         
         try:
-            response = await self.model.generate_content_async(prompt)
-            return response.text
+            response = await self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_tokens,
+                )
+            )
+            text = response.text
+            # Clean up markdown code blocks if present
+            if text.startswith("```"):
+                lines = text.split("\n")
+                # Remove first line (```json) and last line (```)
+                if lines[-1].strip() == "```":
+                    text = "\n".join(lines[1:-1])
+                else:
+                    text = "\n".join(lines[1:])
+            return text.strip()
         except Exception as e:
             logger.with_agent(self.name).error(f"LLM call failed: {e}")
             return "{}"

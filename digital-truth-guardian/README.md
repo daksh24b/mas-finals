@@ -22,6 +22,9 @@ Digital Truth Guardian is a production-grade AI system designed to combat the so
 - **Qdrant Hybrid Search** with dense (semantic) + sparse (keyword) vectors
 - **Temporal Memory Evolution** distinguishing between immutable facts and transient states
 - **Trusted Source Protocol** ensuring unverified claims are never memorized
+- **Episodic Memory** for learning from past agent decisions and outcomes
+- **Shared Context Memory** enabling inter-agent communication via vector store
+- **Dynamic Tool Selection** autonomously choosing optimal tools based on query type
 
 ---
 
@@ -68,11 +71,35 @@ Digital Truth Guardian is a production-grade AI system designed to combat the so
 
 | Agent | Model | Role |
 |-------|-------|------|
-| **Planner** | Gemini Flash | Intent classification, task decomposition, routing |
-| **Retriever** | Code-based | Qdrant hybrid search (dense + sparse vectors) |
-| **Executor** | Code-based | External web search via Tavily AI |
-| **Critic** | Gemini Pro | Deep reasoning, entailment checking, verdict |
-| **Archivist** | Gemini Flash | Memory management, temporal versioning |
+| **Planner** | Gemini Flash | Intent classification, task decomposition, dynamic tool selection, routing |
+| **Retriever** | Code-based | Qdrant hybrid search (dense + sparse vectors), episodic memory recording |
+| **Executor** | Code-based | External web search via Tavily AI with trusted source filtering |
+| **Critic** | Gemini Pro | Deep reasoning, entailment checking, verdict, shares insights via shared context |
+| **Archivist** | Gemini Flash | Memory management, temporal versioning, fact classification |
+
+### Memory Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MULTI-COLLECTION MEMORY                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
+│  │  KNOWLEDGE BASE │  │ EPISODIC MEMORY │  │ SHARED CONTEXT  │  │
+│  │                 │  │                 │  │                 │  │
+│  │  Verified facts │  │  Past agent     │  │  Inter-agent    │  │
+│  │  & claims with  │  │  decisions &    │  │  communication  │  │
+│  │  temporal       │  │  outcomes for   │  │  & coordination │  │
+│  │  versioning     │  │  learning       │  │                 │  │
+│  │                 │  │                 │  │                 │  │
+│  │  ┌───────────┐  │  │  ┌───────────┐  │  │  ┌───────────┐  │  │
+│  │  │Dense+Sparse│  │  │  │Dense Only │  │  │  │Dense Only │  │  │
+│  │  │  Hybrid   │  │  │  │ Semantic  │  │  │  │ Semantic  │  │  │
+│  │  └───────────┘  │  │  └───────────┘  │  │  └───────────┘  │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -153,19 +180,21 @@ curl -X POST http://localhost:8000/verify \
 digital-truth-guardian/
 ├── src/
 │   ├── agents/               # 5-Agent implementations
-│   │   ├── planner.py        # Intent classification & routing
-│   │   ├── retriever.py      # Qdrant hybrid search
-│   │   ├── executor.py       # Tavily web search
-│   │   ├── critic.py         # Evidence analysis & verdict
-│   │   └── archivist.py      # Memory management
+│   │   ├── base.py           # Base agent with episodic memory & shared context
+│   │   ├── planner.py        # Intent classification, dynamic tool selection & routing
+│   │   ├── retriever.py      # Qdrant hybrid search with episode recording
+│   │   ├── executor.py       # Tavily web search with source filtering
+│   │   ├── critic.py         # Evidence analysis, verdict & insight sharing
+│   │   └── archivist.py      # Memory management & temporal versioning
 │   ├── core/
 │   │   ├── config.py         # Configuration management
 │   │   ├── state.py          # LangGraph state definitions
 │   │   └── graph.py          # LangGraph orchestration
 │   ├── database/
-│   │   ├── qdrant_client.py  # Qdrant operations
+│   │   ├── qdrant_client.py  # Qdrant operations for knowledge base
+│   │   ├── memory_manager.py # Episodic & shared context memory
 │   │   ├── embeddings.py     # Dense + Sparse embeddings
-│   │   └── schema.py         # Collection schemas
+│   │   └── schema.py         # All collection schemas
 │   ├── tools/
 │   │   ├── tavily_search.py  # Tavily integration
 │   │   └── source_filter.py  # Trusted source filtering
@@ -209,7 +238,11 @@ Edit `data/trusted_sources.json` to customize source tiers:
 
 ## 🗄️ Database Design
 
-### Qdrant Collection: `knowledge_base`
+Digital Truth Guardian uses **three separate Qdrant collections** for different memory types:
+
+### Collection 1: `knowledge_base` (Knowledge Memory)
+
+Stores verified facts and claims with hybrid search capability.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -222,11 +255,41 @@ Edit `data/trusted_sources.json` to customize source tiers:
 | `valid_from` | timestamp | Temporal versioning |
 | `valid_to` | timestamp | NULL = currently valid |
 
+### Collection 2: `episodic_memory` (Episodic Memory)
+
+Stores past agent decisions and outcomes for learning from experience.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vector_dense` | 768d float | Semantic embedding of episode |
+| `session_id` | keyword | Session identifier |
+| `agent_name` | keyword | Which agent made the decision |
+| `action_type` | keyword | retrieval, search, critique, route |
+| `outcome` | keyword | success, failure, uncertain, cache_hit |
+| `decision_reasoning` | text | Why the decision was made |
+| `tools_used` | array | Tools used in this action |
+| `confidence` | float | Confidence score |
+
+### Collection 3: `shared_context` (Shared Team Memory)
+
+Enables inter-agent communication and coordination.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `vector_dense` | 768d float | Semantic embedding of context |
+| `context_type` | keyword | task_context, insight, warning, strategy |
+| `agent_source` | keyword | Which agent wrote this |
+| `content` | text | The shared information |
+| `target_agents` | array | Which agents should read (empty = all) |
+| `priority` | integer | 1-5, higher = more important |
+| `expires_at` | timestamp | TTL for temporary context |
+
 ### Optimization Features
 
 - **Binary Quantization**: 30x compression for fast retrieval
-- **Hybrid Search**: Combines semantic + keyword matching
+- **Hybrid Search**: Combines semantic + keyword matching (knowledge_base)
 - **Temporal Versioning**: Handles changing facts correctly
+- **Metadata Filtering**: Filter by agent, outcome, priority, session
 
 ---
 
@@ -331,10 +394,27 @@ Knowledge base statistics.
 | Criteria | Implementation |
 |----------|----------------|
 | **Correct Qdrant Usage** | Hybrid Search (Dense + Sparse), Binary Quantization, Metadata Filtering |
+| **Multiple Collections** | 3 collections: knowledge_base, episodic_memory, shared_context |
+| **Episodic Memory** | Agents record decisions and recall similar past experiences |
+| **Shared Team Memory** | Agents read/write to shared vector store for coordination |
+| **Autonomous Tool Selection** | Planner dynamically chooses QDRANT, TAVILY, or BOTH based on query |
 | **Agentic Architecture** | Planner-Router with dynamic tool selection and feedback loops |
 | **Memory Evolution** | Temporal versioning for TRANSIENT vs STATIC facts |
 | **Societal Relevance** | Combats misinformation with "Safe Fail" protocol |
 | **Tech Stack** | State-of-the-art Gemini + LangGraph orchestration |
+
+### Hackathon Criteria Checklist
+
+| Requirement | Status |
+|-------------|--------|
+| Clear Agent Roles | ✅ 5 distinct agents with well-defined responsibilities |
+| Structured Communication | ✅ LangGraph TypedDict state with structured outputs |
+| Coordinated Decisions | ✅ Planner routes based on retrieval scores + feedback |
+| Vector Search as Memory | ✅ Three collections for different memory types |
+| Retrieval as Active Decision | ✅ Planner decides WHEN to retrieve |
+| Tool-Aware Agents | ✅ Dynamic tool selection based on query analysis |
+| Memory Improves Decisions | ✅ Episodic memory recalls successful past strategies |
+| Metadata-Aware Filtering | ✅ Filter by agent, outcome, priority, session_id |
 
 ---
 

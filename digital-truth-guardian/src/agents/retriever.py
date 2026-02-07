@@ -10,7 +10,7 @@ Responsible for:
 
 from typing import List, Optional
 
-from qdrant_client.models import Filter, FieldCondition, MatchValue, IsNullCondition
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from .base import BaseAgent
 from ..core.config import settings
@@ -54,6 +54,7 @@ class RetrieverAgent(BaseAgent):
         Process state by retrieving relevant documents.
         
         Performs hybrid search and evaluates if results are sufficient.
+        Records the retrieval outcome to episodic memory.
         """
         state = add_agent_to_trace(state, self.name)
         
@@ -67,11 +68,22 @@ class RetrieverAgent(BaseAgent):
         # Build filters based on context
         filters = self._build_filters(state)
         
+        # Check tool strategy - may skip Qdrant in favor of direct web search
+        tool_strategy = state.get("tool_strategy", "BOTH_SEQUENTIAL")
+        if tool_strategy == "TAVILY_WEB_SEARCH":
+            # Skip Qdrant, let Executor handle it
+            logger.with_agent(self.name).info(
+                "Skipping Qdrant search per tool strategy"
+            )
+            state["retrieved_documents"] = []
+            state["retrieval_scores"] = []
+            state["cache_hit"] = False
+            return state
+        
         # Perform hybrid search
         documents = await self.qdrant.hybrid_search(
             query=query,
-            top_k=self.top_k,
-            filters=filters,
+            limit=self.top_k,
             score_threshold=self.confidence_threshold * 0.5  # RRF scores are lower
         )
         
@@ -82,6 +94,35 @@ class RetrieverAgent(BaseAgent):
         state["retrieved_documents"] = [doc.to_dict() for doc in documents]
         state["retrieval_scores"] = [doc.score for doc in documents]
         state["cache_hit"] = cache_hit
+        
+        # Determine outcome for episodic memory
+        if cache_hit:
+            outcome = "cache_hit"
+        elif len(documents) > 0:
+            outcome = "success"
+        else:
+            outcome = "no_results"
+        
+        # Record episode to episodic memory
+        await self.record_episode(
+            state=state,
+            action_type="retrieval",
+            outcome=outcome,
+            decision_reasoning=f"Found {len(documents)} docs with avg_score={avg_score:.3f}",
+            confidence=avg_score,
+            retrieval_score=avg_score,
+            tools_used=["qdrant_hybrid_search"],
+        )
+        
+        # If cache hit, share this insight
+        if cache_hit:
+            await self.write_shared_context(
+                content=f"Cache hit for query: '{query[:50]}...' - using cached verdict",
+                context_type="insight",
+                session_id=state.get("session_id"),
+                priority=2,
+                ttl_minutes=10,
+            )
         
         logger.with_agent(self.name).info(
             f"Retrieved {len(documents)} documents, "
@@ -107,20 +148,10 @@ class RetrieverAgent(BaseAgent):
         Currently filters for:
         - Currently valid records only (valid_to is null)
         """
-        # Base filter: only currently valid records
-        conditions = [
-            FieldCondition(
-                key="valid_to",
-                is_null=IsNullCondition(is_null=True)
-            )
-        ]
-        
-        # Could add more filters based on state context:
-        # - Filter by fact_type if specified
-        # - Filter by source domain for trusted sources
-        # - Filter by date range for temporal queries
-        
-        return Filter(must=conditions) if conditions else None
+        # For now, skip filtering - the hybrid_search in qdrant_client
+        # already handles valid_to filtering internally
+        # This avoids API compatibility issues with IsNullCondition
+        return None
     
     def _evaluate_retrieval(
         self,
@@ -171,7 +202,7 @@ class RetrieverAgent(BaseAgent):
                 ),
                 FieldCondition(
                     key="valid_to",
-                    is_null=IsNullCondition(is_null=True)
+                    is_null=True
                 )
             ]
         )

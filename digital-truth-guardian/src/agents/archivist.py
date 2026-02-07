@@ -13,7 +13,8 @@ import json
 from datetime import datetime
 from typing import Optional, Tuple
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from .base import BaseAgent
 from ..core.config import settings, ModelConfig
@@ -130,20 +131,15 @@ class ArchivistAgent(BaseAgent):
         self.qdrant = qdrant_manager or get_qdrant_manager()
         self.source_filter = source_filter or get_source_filter()
         self.model_name = ModelConfig.ARCHIVIST["model"]
+        self.temperature = ModelConfig.ARCHIVIST["temperature"]
+        self.max_tokens = ModelConfig.ARCHIVIST["max_tokens"]
         self.min_tier_for_memory = TrustTier(settings.min_source_tier_for_memory)
         
-        # Configure Gemini
+        # Configure Gemini client
         if settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config={
-                    "temperature": ModelConfig.ARCHIVIST["temperature"],
-                    "max_output_tokens": ModelConfig.ARCHIVIST["max_tokens"]
-                }
-            )
+            self.client = genai.Client(api_key=settings.gemini_api_key)
         else:
-            self.model = None
+            self.client = None
     
     async def process(self, state: AgentState) -> AgentState:
         """
@@ -306,7 +302,7 @@ class ArchivistAgent(BaseAgent):
         context: str
     ) -> FactType:
         """Classify the fact as STATIC or TRANSIENT."""
-        if not self.model:
+        if not self.client:
             # Default to STATIC if no LLM
             return FactType.STATIC
         
@@ -317,7 +313,14 @@ class ArchivistAgent(BaseAgent):
         )
         
         try:
-            response = await self.model.generate_content_async(prompt)
+            response = await self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_tokens,
+                )
+            )
             text = response.text
             
             # Extract JSON
@@ -358,7 +361,7 @@ class ArchivistAgent(BaseAgent):
             }
         
         # Use LLM to determine relationship
-        if self.model:
+        if self.client:
             prompt = DEDUPLICATION_PROMPT.format(
                 new_fact=claim,
                 new_verdict=verdict.value,
@@ -368,7 +371,14 @@ class ArchivistAgent(BaseAgent):
             )
             
             try:
-                response = await self.model.generate_content_async(prompt)
+                response = await self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=self.temperature,
+                        max_output_tokens=self.max_tokens,
+                    )
+                )
                 text = response.text
                 
                 if "```json" in text:

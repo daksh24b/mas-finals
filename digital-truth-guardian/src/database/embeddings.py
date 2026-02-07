@@ -1,15 +1,16 @@
 """
 Embedding service for generating dense and sparse vectors.
 
-Uses Google text-embedding-004 for dense vectors and
-FastEmbed BM25/SPLADE for sparse vectors.
+Uses Google gemini-embedding-001 for dense vectors and
+FastEmbed SPLADE for sparse vectors.
 """
 
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from fastembed import SparseTextEmbedding
 
 from ..core.config import settings
@@ -25,8 +26,8 @@ class EmbeddingService:
     Service for generating both dense and sparse embeddings.
     
     Implements a hybrid embedding strategy:
-    - Dense: Google text-embedding-004 (768d) for semantic similarity
-    - Sparse: FastEmbed BM25/SPLADE for keyword matching
+    - Dense: Google gemini-embedding-001 (768d) for semantic similarity
+    - Sparse: FastEmbed SPLADE for keyword matching
     """
     
     def __init__(
@@ -47,9 +48,11 @@ class EmbeddingService:
         self.sparse_model = sparse_model or settings.sparse_embedding_model
         self.api_key = api_key or settings.gemini_api_key
         
-        # Initialize Google AI
+        # Initialize Google AI client
         if self.api_key:
-            genai.configure(api_key=self.api_key)
+            self.client = genai.Client(api_key=self.api_key)
+        else:
+            self.client = None
         
         # Lazy-load sparse model
         self._sparse_encoder: Optional[SparseTextEmbedding] = None
@@ -70,25 +73,23 @@ class EmbeddingService:
     @async_retry(max_retries=3, delay=1.0)
     async def embed_dense(self, text: str) -> List[float]:
         """
-        Generate dense embedding using Google text-embedding-004.
+        Generate dense embedding using Google gemini-embedding-001.
         
         Args:
             text: Text to embed
             
         Returns:
-            768-dimensional dense vector
+            3072-dimensional dense vector
         """
-        # Run in thread pool since genai is sync
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: genai.embed_content(
-                model=self.dense_model,
-                content=text,
-                task_type="retrieval_document"
-            )
+        if not self.client:
+            raise ValueError("Google API client not initialized")
+        
+        response = await self.client.aio.models.embed_content(
+            model=self.dense_model,
+            contents=text,
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
         )
-        return result["embedding"]
+        return list(response.embeddings[0].values)
     
     @async_retry(max_retries=3, delay=1.0)
     async def embed_dense_query(self, text: str) -> List[float]:
@@ -101,16 +102,15 @@ class EmbeddingService:
         Returns:
             768-dimensional dense vector
         """
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: genai.embed_content(
-                model=self.dense_model,
-                content=text,
-                task_type="retrieval_query"
-            )
+        if not self.client:
+            raise ValueError("Google API client not initialized")
+        
+        response = await self.client.aio.models.embed_content(
+            model=self.dense_model,
+            contents=text,
+            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
         )
-        return result["embedding"]
+        return list(response.embeddings[0].values)
     
     async def embed_sparse(self, text: str) -> Dict[str, Any]:
         """
@@ -177,17 +177,16 @@ class EmbeddingService:
             batch = texts[i:i + batch_size]
             
             # Google's batch embedding
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda b=batch: genai.embed_content(
-                    model=self.dense_model,
-                    content=b,
-                    task_type="retrieval_document"
-                )
+            if not self.client:
+                raise ValueError("Google API client not initialized")
+            
+            response = await self.client.aio.models.embed_content(
+                model=self.dense_model,
+                contents=batch,
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
             )
             
-            all_embeddings.extend(result["embedding"])
+            all_embeddings.extend([list(e.values) for e in response.embeddings])
         
         return all_embeddings
     

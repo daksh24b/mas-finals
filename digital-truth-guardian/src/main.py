@@ -222,20 +222,50 @@ def init():
 
 
 async def _init_database():
-    """Initialize Qdrant collections."""
+    """Initialize all Qdrant collections."""
     console.print("[yellow]Initializing database...[/yellow]")
     
     try:
-        qdrant = get_qdrant_manager()
-        await qdrant.ensure_collection_exists()
-        console.print("[green]✓ Knowledge base collection created[/green]")
+        # Import memory manager
+        from .database.memory_manager import get_memory_manager, init_memory_collections
         
+        # Initialize knowledge base collection
+        qdrant = get_qdrant_manager()
+        kb_created = await qdrant.ensure_collection_exists()
+        if kb_created:
+            console.print("[green]✓ Knowledge base collection created[/green]")
+        else:
+            console.print("[dim]✓ Knowledge base collection exists[/dim]")
+        
+        # Initialize memory collections (episodic + shared context)
+        memory_results = await init_memory_collections()
+        
+        for collection_name, was_created in memory_results.items():
+            if was_created:
+                console.print(f"[green]✓ {collection_name} collection created[/green]")
+            else:
+                console.print(f"[dim]✓ {collection_name} collection exists[/dim]")
+        
+        # Show collection info
+        console.print()
         info = await qdrant.get_collection_info()
-        console.print(f"[dim]Collection: {info.get('name')}[/dim]")
-        console.print(f"[dim]Status: {info.get('status')}[/dim]")
+        console.print(f"[cyan]Knowledge Base:[/cyan]")
+        console.print(f"  Status: {info.get('status')}")
+        console.print(f"  Points: {info.get('points_count', 0)}")
+        
+        memory_manager = get_memory_manager()
+        memory_stats = await memory_manager.get_memory_stats()
+        
+        console.print(f"\n[cyan]Memory Collections:[/cyan]")
+        for coll_name, stats in memory_stats.items():
+            console.print(f"  {coll_name}: {stats.get('points_count', 0)} points")
+        
+        console.print("\n[green]✓ All collections initialized successfully[/green]")
         
     except Exception as e:
         console.print(f"[red]Initialization failed: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

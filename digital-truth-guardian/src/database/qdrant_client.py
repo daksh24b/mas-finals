@@ -1,622 +1,513 @@
 """
-Qdrant client manager for database operations.
+Qdrant Database Client
 
-Handles connection, collection management, and CRUD operations
-for the knowledge base with hybrid search support.
+Manages connections and operations with Qdrant vector database.
+Implements hybrid search, temporal versioning, and collection management.
 """
 
 import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from functools import lru_cache
+from uuid import uuid4
 
 from qdrant_client import QdrantClient, AsyncQdrantClient
-from qdrant_client.models import (
+from qdrant_client.http import models
+from qdrant_client.http.models import (
     Distance,
+    VectorParams,
+    SparseVectorParams,
+    SparseIndexParams,
+    SparseVector,
     PointStruct,
-    PointIdsList,
     Filter,
     FieldCondition,
     MatchValue,
-    IsNullCondition,
     Range,
-    SearchParams,
-    QuantizationSearchParams,
+    SearchRequest,
     ScoredPoint,
     UpdateStatus,
-    PayloadSchemaType,
-    SparseVector,
 )
 
 from ..core.config import settings
-from ..core.state import Verdict, FactType, RetrievedDocument
 from ..utils.logger import get_logger
-from ..utils.helpers import generate_content_hash, async_retry
 from .schema import (
     KnowledgeRecord,
-    CollectionSchema,
-    KNOWLEDGE_BASE_SCHEMA,
-    PAYLOAD_INDEXES
+    SearchResult,
+    VerdictType,
+    FactType,
+    SourceTier,
+    DENSE_VECTOR_NAME,
+    SPARSE_VECTOR_NAME,
+    DENSE_VECTOR_SIZE,
 )
-from .embeddings import EmbeddingService, get_embedding_service
+from .embeddings import get_embedding_service
 
 
-logger = get_logger()
+logger = get_logger("Database")
 
 
 class QdrantManager:
     """
-    Manager for Qdrant database operations.
+    Manages Qdrant database operations for the Digital Truth Guardian.
     
-    Provides high-level operations for:
-    - Collection management
-    - Hybrid search (dense + sparse)
-    - Knowledge base CRUD
-    - Temporal versioning
+    Implements:
+    - Hybrid search (dense + sparse vectors)
+    - Temporal versioning for transient facts
+    - Binary quantization for efficiency
+    - Metadata filtering
     """
     
     def __init__(
         self,
-        url: str = None,
-        api_key: str = None,
-        collection_name: str = None,
-        embedding_service: EmbeddingService = None
+        url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        collection_name: Optional[str] = None,
     ):
-        """
-        Initialize Qdrant manager.
-        
-        Args:
-            url: Qdrant server URL
-            api_key: Qdrant API key (for cloud)
-            collection_name: Default collection name
-            embedding_service: Embedding service instance
-        """
         self.url = url or settings.qdrant_url
         self.api_key = api_key or settings.qdrant_api_key
         self.collection_name = collection_name or settings.qdrant_collection_name
-        self.embedding_service = embedding_service or get_embedding_service()
         
         # Initialize clients
-        client_kwargs = {"url": self.url, "timeout": settings.qdrant_timeout}
+        client_kwargs = {"url": self.url, "timeout": 30}
         if self.api_key:
             client_kwargs["api_key"] = self.api_key
         
-        self.sync_client = QdrantClient(**client_kwargs)
+        self.client = QdrantClient(**client_kwargs)
         self.async_client = AsyncQdrantClient(**client_kwargs)
         
-        logger.with_agent("Database").info(
-            f"Initialized Qdrant manager: url={self.url}, collection={self.collection_name}"
-        )
+        # Embedding service
+        self._embedding_service = None
+        
+        logger.info(f"Initialized Qdrant manager: url={self.url}, collection={self.collection_name}")
+    
+    @property
+    def embedding_service(self):
+        """Lazy load embedding service."""
+        if self._embedding_service is None:
+            self._embedding_service = get_embedding_service()
+        return self._embedding_service
     
     # ==================== Collection Management ====================
     
-    async def ensure_collection_exists(
-        self,
-        schema: CollectionSchema = None
-    ) -> bool:
-        """
-        Ensure the collection exists, creating if necessary.
-        
-        Args:
-            schema: Collection schema (defaults to knowledge_base schema)
-            
-        Returns:
-            True if collection exists or was created
-        """
-        schema = schema or KNOWLEDGE_BASE_SCHEMA
-        
+    async def ensure_collection_exists(self) -> bool:
+        """Create collection if it doesn't exist."""
         try:
             collections = await self.async_client.get_collections()
-            collection_names = [c.name for c in collections.collections]
+            exists = any(c.name == self.collection_name for c in collections.collections)
             
-            if schema.name in collection_names:
-                logger.with_agent("Database").info(
-                    f"Collection '{schema.name}' already exists"
-                )
+            if not exists:
+                await self._create_collection()
                 return True
             
-            # Create collection
-            config = schema.to_qdrant_config()
-            await self.async_client.create_collection(
-                collection_name=schema.name,
-                **config
-            )
-            
-            # Apply quantization
-            quantization = schema.get_quantization_config()
-            if quantization:
-                await self.async_client.update_collection(
-                    collection_name=schema.name,
-                    quantization_config=quantization
-                )
-            
-            # Create payload indexes
-            for index in PAYLOAD_INDEXES:
-                await self.async_client.create_payload_index(
-                    collection_name=schema.name,
-                    field_name=index["field_name"],
-                    field_schema=index["field_schema"]
-                )
-            
-            logger.with_agent("Database").info(
-                f"Created collection '{schema.name}' with hybrid vectors"
-            )
-            return True
+            return False
             
         except Exception as e:
-            logger.with_agent("Database").error(
-                f"Error ensuring collection: {str(e)}"
-            )
+            logger.error(f"Failed to ensure collection exists: {e}")
             raise
     
-    async def get_collection_info(self) -> Dict[str, Any]:
-        """Get collection statistics and info."""
-        info = await self.async_client.get_collection(self.collection_name)
-        return {
-            "name": self.collection_name,
-            "vectors_count": info.vectors_count,
-            "points_count": info.points_count,
-            "status": info.status.value,
-            "config": {
-                "dense_size": info.config.params.vectors.get("dense").size if hasattr(info.config.params.vectors, "get") else None,
-            }
-        }
-    
-    # ==================== Hybrid Search ====================
-    
-    @async_retry(max_retries=2, delay=0.5)
-    async def hybrid_search(
-        self,
-        query: str,
-        top_k: int = None,
-        alpha: float = None,
-        filters: Optional[Filter] = None,
-        score_threshold: float = None
-    ) -> List[RetrievedDocument]:
-        """
-        Perform hybrid search combining dense and sparse vectors.
-        
-        Uses RRF (Reciprocal Rank Fusion) to combine results from
-        both dense (semantic) and sparse (keyword) searches.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to return
-            alpha: Weight for dense vs sparse (0=sparse, 1=dense)
-            filters: Qdrant filters to apply
-            score_threshold: Minimum score threshold
-            
-        Returns:
-            List of RetrievedDocument objects
-        """
-        top_k = top_k or settings.retriever_top_k
-        alpha = alpha if alpha is not None else settings.hybrid_search_alpha
-        score_threshold = score_threshold or settings.confidence_threshold
-        
-        # Generate embeddings
-        dense_vector, sparse_vector = await asyncio.gather(
-            self.embedding_service.embed_dense_query(query),
-            self.embedding_service.embed_sparse(query)
-        )
-        
-        # Build base filter for currently valid records
-        base_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="valid_to",
-                    is_null=IsNullCondition(is_null=True)
+    async def _create_collection(self):
+        """Create the knowledge base collection with hybrid vectors."""
+        await self.async_client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config={
+                DENSE_VECTOR_NAME: VectorParams(
+                    size=DENSE_VECTOR_SIZE,
+                    distance=Distance.COSINE,
+                    on_disk=True,
+                    # Binary quantization for efficiency
+                    quantization_config=models.BinaryQuantization(
+                        binary=models.BinaryQuantizationConfig(
+                            always_ram=True
+                        )
+                    )
                 )
-            ]
-        )
-        
-        # Merge with user filters
-        if filters:
-            if filters.must:
-                base_filter.must.extend(filters.must)
-            if filters.should:
-                base_filter.should = filters.should
-            if filters.must_not:
-                base_filter.must_not = filters.must_not
-        
-        # Perform hybrid search using query API
-        results = await self.async_client.query_points(
-            collection_name=self.collection_name,
-            prefetch=[
-                # Dense search
-                {
-                    "query": dense_vector,
-                    "using": "dense",
-                    "limit": top_k * 2,
-                    "filter": base_filter
-                },
-                # Sparse search
-                {
-                    "query": SparseVector(
-                        indices=sparse_vector["indices"],
-                        values=sparse_vector["values"]
-                    ),
-                    "using": "sparse",
-                    "limit": top_k * 2,
-                    "filter": base_filter
-                }
-            ],
-            query={"fusion": "rrf"},  # Reciprocal Rank Fusion
-            limit=top_k,
-            with_payload=True,
-            score_threshold=score_threshold * 0.5  # RRF scores are lower
-        )
-        
-        # Convert to RetrievedDocument objects
-        documents = []
-        for point in results.points:
-            payload = point.payload or {}
-            documents.append(RetrievedDocument(
-                id=str(point.id),
-                text=payload.get("text", ""),
-                score=point.score,
-                source_domain=payload.get("source_domain"),
-                verdict=Verdict(payload["verdict"]) if payload.get("verdict") else None,
-                fact_type=FactType(payload["fact_type"]) if payload.get("fact_type") else None,
-                valid_from=datetime.fromisoformat(payload["valid_from"]) if payload.get("valid_from") else None,
-                valid_to=datetime.fromisoformat(payload["valid_to"]) if payload.get("valid_to") else None,
-                metadata={
-                    "confidence": payload.get("confidence", 0),
-                    "explanation": payload.get("explanation", ""),
-                    "content_hash": payload.get("content_hash", "")
-                }
-            ))
-        
-        logger.with_agent("Retriever").info(
-            f"Hybrid search returned {len(documents)} results for: {query[:50]}..."
-        )
-        
-        return documents
-    
-    async def dense_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        filters: Optional[Filter] = None
-    ) -> List[RetrievedDocument]:
-        """Perform dense-only semantic search."""
-        dense_vector = await self.embedding_service.embed_dense_query(query)
-        
-        results = await self.async_client.search(
-            collection_name=self.collection_name,
-            query_vector=("dense", dense_vector),
-            limit=top_k,
-            query_filter=filters,
-            with_payload=True
-        )
-        
-        return self._convert_search_results(results)
-    
-    async def sparse_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        filters: Optional[Filter] = None
-    ) -> List[RetrievedDocument]:
-        """Perform sparse-only keyword search."""
-        sparse_vector = await self.embedding_service.embed_sparse(query)
-        
-        results = await self.async_client.search(
-            collection_name=self.collection_name,
-            query_vector=(
-                "sparse",
-                SparseVector(
-                    indices=sparse_vector["indices"],
-                    values=sparse_vector["values"]
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: SparseVectorParams(
+                    index=SparseIndexParams(
+                        on_disk=False
+                    )
                 )
+            },
+            # Optimized for hybrid search
+            optimizers_config=models.OptimizersConfigDiff(
+                indexing_threshold=20000,
+                memmap_threshold=50000,
             ),
-            limit=top_k,
-            query_filter=filters,
-            with_payload=True
+            # Enable payload indexing for filters
+            on_disk_payload=True,
         )
         
-        return self._convert_search_results(results)
+        # Create payload indexes for common filters
+        await self._create_payload_indexes()
+        
+        logger.info(f"Created collection '{self.collection_name}' with hybrid vectors")
     
-    def _convert_search_results(
-        self,
-        results: List[ScoredPoint]
-    ) -> List[RetrievedDocument]:
-        """Convert Qdrant search results to RetrievedDocument objects."""
-        documents = []
-        for point in results:
-            payload = point.payload or {}
-            documents.append(RetrievedDocument(
-                id=str(point.id),
-                text=payload.get("text", ""),
-                score=point.score,
-                source_domain=payload.get("source_domain"),
-                verdict=Verdict(payload["verdict"]) if payload.get("verdict") else None,
-                fact_type=FactType(payload["fact_type"]) if payload.get("fact_type") else None,
-                metadata=payload
-            ))
-        return documents
+    async def _create_payload_indexes(self):
+        """Create indexes on commonly filtered fields."""
+        index_fields = [
+            ("verdict", models.PayloadSchemaType.KEYWORD),
+            ("fact_type", models.PayloadSchemaType.KEYWORD),
+            ("source_tier", models.PayloadSchemaType.KEYWORD),
+            ("source_domain", models.PayloadSchemaType.KEYWORD),
+            ("valid_to", models.PayloadSchemaType.DATETIME),
+        ]
+        
+        for field_name, field_type in index_fields:
+            try:
+                await self.async_client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=field_type,
+                )
+            except Exception as e:
+                # Index might already exist
+                logger.debug(f"Index creation for {field_name}: {e}")
     
-    # ==================== CRUD Operations ====================
+    async def delete_collection(self):
+        """Delete the collection."""
+        await self.async_client.delete_collection(self.collection_name)
+        logger.info(f"Deleted collection '{self.collection_name}'")
     
-    async def upsert_record(
-        self,
-        record: KnowledgeRecord
-    ) -> bool:
+    async def get_collection_info(self) -> Dict[str, Any]:
+        """Get collection information."""
+        try:
+            info = await self.async_client.get_collection(self.collection_name)
+            return {
+                "name": self.collection_name,
+                "status": str(info.status),
+                "points_count": info.points_count or 0,
+                "vectors_count": info.points_count or 0,  # Use points_count as proxy
+                "indexed_vectors_count": info.indexed_vectors_count or 0,
+                "segments_count": info.segments_count or 0,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get collection info: {e}")
+            return {
+                "name": self.collection_name,
+                "status": "error",
+                "points_count": 0,
+                "vectors_count": 0,
+                "error": str(e)
+            }
+    
+    # ==================== Write Operations ====================
+    
+    async def upsert_record(self, record: KnowledgeRecord) -> str:
         """
         Insert or update a knowledge record.
         
-        Args:
-            record: KnowledgeRecord to upsert
-            
-        Returns:
-            True if successful
+        For TRANSIENT facts, implements temporal versioning.
         """
-        # Generate embeddings if not present
-        if record.vector_dense is None or record.vector_sparse is None:
-            dense, sparse = await self.embedding_service.embed_hybrid(record.text)
-            record.vector_dense = dense
-            record.vector_sparse = sparse
+        # Generate embeddings
+        dense_vector, sparse_vector = await self.embedding_service.embed_hybrid(record.text)
         
-        # Generate content hash for deduplication
-        if not record.content_hash:
-            record.content_hash = generate_content_hash(record.text)
+        # Handle temporal versioning for transient facts
+        if record.fact_type == FactType.TRANSIENT:
+            await self._expire_old_versions(record.text, record.claim_hash)
         
-        # Create point
+        # Prepare point
         point = PointStruct(
             id=record.id,
             vector={
-                "dense": record.vector_dense,
-                "sparse": SparseVector(
-                    indices=record.vector_sparse["indices"],
-                    values=record.vector_sparse["values"]
-                )
+                DENSE_VECTOR_NAME: dense_vector,
+                SPARSE_VECTOR_NAME: sparse_vector,
             },
-            payload=record.to_payload()
+            payload=record.to_payload(),
         )
         
-        # Upsert
+        # Upsert to Qdrant
         result = await self.async_client.upsert(
             collection_name=self.collection_name,
-            points=[point]
+            points=[point],
+            wait=True,
         )
         
-        success = result.status == UpdateStatus.COMPLETED
-        
-        if success:
-            logger.with_agent("Archivist").info(
-                f"Upserted record: {record.id} (verdict={record.verdict.value})"
-            )
-        
-        return success
+        if result.status == UpdateStatus.COMPLETED:
+            logger.info(f"Upserted record: {record.id} ({record.verdict})")
+            return record.id
+        else:
+            raise Exception(f"Upsert failed with status: {result.status}")
     
-    async def batch_upsert(
-        self,
-        records: List[KnowledgeRecord],
-        batch_size: int = 100
-    ) -> int:
-        """
-        Batch upsert multiple records.
+    async def _expire_old_versions(self, text: str, claim_hash: Optional[str] = None):
+        """Mark old versions of a transient fact as expired."""
+        if not claim_hash:
+            return
         
-        Args:
-            records: List of records to upsert
-            batch_size: Number of records per batch
-            
-        Returns:
-            Number of records successfully upserted
-        """
-        # Generate embeddings in batches
-        texts = [r.text for r in records]
-        embeddings = await self.embedding_service.embed_batch_hybrid(texts, batch_size)
-        
-        # Assign embeddings to records
-        for record, (dense, sparse) in zip(records, embeddings):
-            record.vector_dense = dense
-            record.vector_sparse = sparse
-            if not record.content_hash:
-                record.content_hash = generate_content_hash(record.text)
-        
-        # Create points
-        points = []
-        for record in records:
-            points.append(PointStruct(
-                id=record.id,
-                vector={
-                    "dense": record.vector_dense,
-                    "sparse": SparseVector(
-                        indices=record.vector_sparse["indices"],
-                        values=record.vector_sparse["values"]
-                    )
-                },
-                payload=record.to_payload()
-            ))
-        
-        # Batch upsert
-        success_count = 0
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            result = await self.async_client.upsert(
-                collection_name=self.collection_name,
-                points=batch
-            )
-            if result.status == UpdateStatus.COMPLETED:
-                success_count += len(batch)
-        
-        logger.with_agent("Archivist").info(
-            f"Batch upserted {success_count}/{len(records)} records"
-        )
-        
-        return success_count
-    
-    async def check_duplicate(
-        self,
-        text: str,
-        threshold: float = 0.95
-    ) -> Optional[KnowledgeRecord]:
-        """
-        Check if a similar record already exists.
-        
-        Args:
-            text: Text to check for duplicates
-            threshold: Similarity threshold
-            
-        Returns:
-            Existing record if duplicate found, None otherwise
-        """
-        content_hash = generate_content_hash(text)
-        
-        # First check by hash (exact match)
+        # Find existing records with same claim hash that are still valid
         results = await self.async_client.scroll(
             collection_name=self.collection_name,
             scroll_filter=Filter(
                 must=[
                     FieldCondition(
-                        key="content_hash",
-                        match=MatchValue(value=content_hash)
+                        key="claim_hash",
+                        match=MatchValue(value=claim_hash)
+                    ),
+                    FieldCondition(
+                        key="valid_to",
+                        is_null=True
                     )
                 ]
             ),
-            limit=1,
-            with_payload=True
+            limit=100,
         )
         
-        if results[0]:
-            point = results[0][0]
-            return KnowledgeRecord.from_payload(str(point.id), point.payload)
-        
-        # Then check by semantic similarity
-        docs = await self.dense_search(text, top_k=1)
-        if docs and docs[0].score >= threshold:
-            # Fetch full record
-            point = await self.async_client.retrieve(
+        # Update valid_to for all found records
+        now = datetime.utcnow().isoformat()
+        for point in results[0]:
+            await self.async_client.set_payload(
                 collection_name=self.collection_name,
-                ids=[docs[0].id],
-                with_payload=True
+                payload={"valid_to": now},
+                points=[point.id],
             )
-            if point:
-                return KnowledgeRecord.from_payload(
-                    str(point[0].id),
-                    point[0].payload
+            logger.debug(f"Expired old version: {point.id}")
+    
+    async def batch_upsert(self, records: List[KnowledgeRecord]) -> List[str]:
+        """Batch insert multiple records."""
+        if not records:
+            return []
+        
+        points = []
+        for record in records:
+            dense_vector, sparse_vector = await self.embedding_service.embed_hybrid(record.text)
+            
+            points.append(PointStruct(
+                id=record.id,
+                vector={
+                    DENSE_VECTOR_NAME: dense_vector,
+                    SPARSE_VECTOR_NAME: sparse_vector,
+                },
+                payload=record.to_payload(),
+            ))
+        
+        result = await self.async_client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+            wait=True,
+        )
+        
+        if result.status == UpdateStatus.COMPLETED:
+            logger.info(f"Batch upserted {len(records)} records")
+            return [r.id for r in records]
+        else:
+            raise Exception(f"Batch upsert failed: {result.status}")
+    
+    # ==================== Search Operations ====================
+    
+    async def hybrid_search(
+        self,
+        query: str,
+        limit: int = 10,
+        score_threshold: float = 0.5,
+        fact_type: Optional[FactType] = None,
+        verdict: Optional[VerdictType] = None,
+        only_valid: bool = True,
+    ) -> List[SearchResult]:
+        """
+        Perform hybrid search combining dense and sparse vectors.
+        
+        Uses Reciprocal Rank Fusion (RRF) to combine results.
+        """
+        # Generate query embeddings
+        dense_vector, sparse_vector = await self.embedding_service.embed_hybrid(query)
+        
+        # Build filter
+        filter_conditions = []
+        
+        if only_valid:
+            # Only get currently valid records
+            filter_conditions.append(
+                FieldCondition(
+                    key="valid_to",
+                    is_null=True
                 )
-        
-        return None
-    
-    async def expire_record(
-        self,
-        record_id: str
-    ) -> bool:
-        """
-        Expire a record (set valid_to timestamp).
-        
-        Used for temporal versioning of transient facts.
-        
-        Args:
-            record_id: ID of record to expire
-            
-        Returns:
-            True if successful
-        """
-        result = await self.async_client.set_payload(
-            collection_name=self.collection_name,
-            payload={
-                "valid_to": datetime.utcnow().isoformat()
-            },
-            points=[record_id]
-        )
-        
-        success = result.status == UpdateStatus.COMPLETED
-        
-        if success:
-            logger.with_agent("Archivist").info(
-                f"Expired record: {record_id}"
             )
         
-        return success
-    
-    async def update_transient_fact(
-        self,
-        old_record_id: str,
-        new_record: KnowledgeRecord
-    ) -> bool:
-        """
-        Update a transient fact with temporal versioning.
-        
-        Expires the old record and inserts the new one.
-        
-        Args:
-            old_record_id: ID of the existing record to expire
-            new_record: New version of the record
-            
-        Returns:
-            True if both operations succeed
-        """
-        # Expire old record
-        expired = await self.expire_record(old_record_id)
-        if not expired:
-            return False
-        
-        # Insert new record
-        return await self.upsert_record(new_record)
-    
-    async def delete_record(self, record_id: str) -> bool:
-        """Delete a record by ID."""
-        result = await self.async_client.delete(
-            collection_name=self.collection_name,
-            points_selector=PointIdsList(points=[record_id])
-        )
-        return result.status == UpdateStatus.COMPLETED
-    
-    async def get_record_by_id(
-        self,
-        record_id: str
-    ) -> Optional[KnowledgeRecord]:
-        """Retrieve a record by its ID."""
-        points = await self.async_client.retrieve(
-            collection_name=self.collection_name,
-            ids=[record_id],
-            with_payload=True
-        )
-        
-        if points:
-            return KnowledgeRecord.from_payload(
-                str(points[0].id),
-                points[0].payload
+        if fact_type:
+            filter_conditions.append(
+                FieldCondition(
+                    key="fact_type",
+                    match=MatchValue(value=fact_type.value)
+                )
             )
-        return None
+        
+        if verdict:
+            filter_conditions.append(
+                FieldCondition(
+                    key="verdict",
+                    match=MatchValue(value=verdict.value)
+                )
+            )
+        
+        search_filter = Filter(must=filter_conditions) if filter_conditions else None
+        
+        # Perform dense search using query_points (new API)
+        dense_results = await self.async_client.query_points(
+            collection_name=self.collection_name,
+            query=dense_vector,
+            using=DENSE_VECTOR_NAME,
+            query_filter=search_filter,
+            limit=limit * 2,  # Over-fetch for fusion
+            with_payload=True,
+            score_threshold=score_threshold * 0.8,  # Slightly lower threshold
+        )
+        
+        # Perform sparse search using query_points (new API)
+        sparse_results = await self.async_client.query_points(
+            collection_name=self.collection_name,
+            query=models.SparseVector(
+                indices=sparse_vector["indices"],
+                values=sparse_vector["values"],
+            ),
+            using=SPARSE_VECTOR_NAME,
+            query_filter=search_filter,
+            limit=limit * 2,
+            with_payload=True,
+        )
+        
+        # Fuse results using RRF
+        fused_results = self._reciprocal_rank_fusion(
+            dense_results.points,
+            sparse_results.points,
+            k=60  # RRF constant
+        )
+        
+        # Convert to SearchResult objects
+        search_results = []
+        for point, score in fused_results[:limit]:
+            if score >= score_threshold:
+                search_results.append(SearchResult(
+                    id=str(point.id),
+                    text=point.payload.get("text", ""),
+                    score=score,
+                    verdict=VerdictType(point.payload.get("verdict", "UNCERTAIN")),
+                    fact_type=FactType(point.payload.get("fact_type", "STATIC")),
+                    source_domain=point.payload.get("source_domain"),
+                    source_tier=SourceTier(point.payload.get("source_tier", "TIER_5")),
+                    explanation=point.payload.get("explanation"),
+                    valid_from=point.payload.get("valid_from"),
+                    valid_to=point.payload.get("valid_to"),
+                ))
+        
+        logger.debug(f"Hybrid search returned {len(search_results)} results for: {query[:50]}...")
+        return search_results
     
-    # ==================== Analytics ====================
+    def _reciprocal_rank_fusion(
+        self,
+        dense_results: List[ScoredPoint],
+        sparse_results: List[ScoredPoint],
+        k: int = 60,
+        dense_weight: float = 0.6,
+        sparse_weight: float = 0.4,
+    ) -> List[Tuple[ScoredPoint, float]]:
+        """
+        Combine dense and sparse search results using Reciprocal Rank Fusion.
+        
+        RRF Score = Σ (weight / (k + rank))
+        """
+        scores: Dict[str, float] = {}
+        points: Dict[str, ScoredPoint] = {}
+        
+        # Process dense results
+        for rank, point in enumerate(dense_results, 1):
+            point_id = str(point.id)
+            scores[point_id] = scores.get(point_id, 0) + dense_weight / (k + rank)
+            points[point_id] = point
+        
+        # Process sparse results
+        for rank, point in enumerate(sparse_results, 1):
+            point_id = str(point.id)
+            scores[point_id] = scores.get(point_id, 0) + sparse_weight / (k + rank)
+            if point_id not in points:
+                points[point_id] = point
+        
+        # Sort by fused score
+        sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+        
+        return [(points[pid], scores[pid]) for pid in sorted_ids]
+    
+    async def search_similar(
+        self,
+        text: str,
+        limit: int = 5,
+        threshold: float = 0.85,
+    ) -> List[SearchResult]:
+        """Find highly similar records (for deduplication)."""
+        return await self.hybrid_search(
+            query=text,
+            limit=limit,
+            score_threshold=threshold,
+        )
+    
+    async def get_by_id(self, record_id: str) -> Optional[KnowledgeRecord]:
+        """Retrieve a specific record by ID."""
+        try:
+            results = await self.async_client.retrieve(
+                collection_name=self.collection_name,
+                ids=[record_id],
+                with_payload=True,
+            )
+            
+            if results:
+                return KnowledgeRecord.from_payload(
+                    results[0].id,
+                    results[0].payload
+                )
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get record {record_id}: {e}")
+            return None
+    
+    # ==================== Statistics ====================
     
     async def get_verdict_stats(self) -> Dict[str, int]:
-        """Get count of records by verdict."""
+        """Get count of records by verdict type."""
         stats = {}
         
-        for verdict in Verdict:
-            results = await self.async_client.count(
-                collection_name=self.collection_name,
-                count_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="verdict",
-                            match=MatchValue(value=verdict.value)
-                        ),
-                        FieldCondition(
-                            key="valid_to",
-                            is_null=IsNullCondition(is_null=True)
-                        )
-                    ]
+        for verdict in VerdictType:
+            try:
+                count = await self.async_client.count(
+                    collection_name=self.collection_name,
+                    count_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="verdict",
+                                match=MatchValue(value=verdict.value)
+                            ),
+                            FieldCondition(
+                                key="valid_to",
+                                is_null=True
+                            )
+                        ]
+                    )
                 )
-            )
-            stats[verdict.value] = results.count
+                stats[verdict.value] = count.count
+            except Exception:
+                stats[verdict.value] = 0
         
         return stats
     
     async def close(self):
         """Close client connections."""
         await self.async_client.close()
-        self.sync_client.close()
 
 
-# ==================== Cached Instance ====================
+# ==================== Singleton Instance ====================
 
-@lru_cache()
+_qdrant_manager: Optional[QdrantManager] = None
+
+
 def get_qdrant_manager() -> QdrantManager:
-    """Get cached Qdrant manager instance."""
-    return QdrantManager()
+    """Get singleton Qdrant manager instance."""
+    global _qdrant_manager
+    if _qdrant_manager is None:
+        _qdrant_manager = QdrantManager()
+    return _qdrant_manager
+
+
+async def init_qdrant() -> QdrantManager:
+    """Initialize Qdrant and ensure collection exists."""
+    manager = get_qdrant_manager()
+    await manager.ensure_collection_exists()
+    return manager

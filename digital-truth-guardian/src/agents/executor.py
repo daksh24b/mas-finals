@@ -95,6 +95,15 @@ class ExecutorAgent(BaseAgent):
             f"(filtered {filtered_count} untrusted)"
         )
         
+        # Log detailed search results for debugging
+        for i, result in enumerate(trusted_results, 1):
+            logger.with_agent(self.name).info(
+                f"Result {i}: [{result.domain}] {result.title}"
+            )
+            logger.with_agent(self.name).debug(
+                f"Content preview: {result.content[:300]}..."
+            )
+        
         # Generate source summary
         source_urls = [r.url for r in trusted_results]
         source_summary = self.source_filter.get_source_summary(source_urls)
@@ -132,9 +141,12 @@ class ExecutorAgent(BaseAgent):
             # Check against allow-list (max tier threshold)
             if tier <= self.max_trust_tier:
                 trusted.append(result)
-            else:
                 logger.with_agent(self.name).debug(
-                    f"Filtered: {result.domain} (tier {tier.value} > {self.max_trust_tier.value})"
+                    f"Accepted: {result.domain} (tier {tier.value})"
+                )
+            else:
+                logger.with_agent(self.name).info(
+                    f"Filtered: {result.domain} (tier {tier.value} > max {self.max_trust_tier.value})"
                 )
         
         # Sort by trust tier (most trusted first)
