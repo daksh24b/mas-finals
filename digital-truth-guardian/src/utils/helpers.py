@@ -114,19 +114,19 @@ def sanitize_text(text: str) -> str:
 
 def extract_domain(url: str) -> str:
     """
-    Extract the domain from a URL.
-    
-    Args:
-        url: Full URL string
-        
-    Returns:
-        Domain string (e.g., "reuters.com")
+    Extract the domain from a URL or return the domain if already plain.
     """
     try:
+        # If it doesn't have a scheme, it might be a plain domain
+        if not url.startswith(('http://', 'https://')):
+            domain = url.lower().strip()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            return domain
+        
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
         
-        # Remove www. prefix
         if domain.startswith("www."):
             domain = domain[4:]
         

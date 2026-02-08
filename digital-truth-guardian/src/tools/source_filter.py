@@ -340,7 +340,7 @@ class SourceFilter:
         elif best_tier <= TrustTier.TIER_2_MAJOR_NEWS:
             quality = "good"
             recommendation = "Major news sources available - good confidence"
-        elif best_tier <= TrustTier.TIER_3_REPUTABLE:
+        elif best_tier <= TrustTier.TIER_4_GENERAL:
             quality = "moderate"
             recommendation = "Reputable sources available - moderate confidence"
         else:

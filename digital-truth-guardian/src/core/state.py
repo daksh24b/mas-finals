@@ -88,11 +88,20 @@ class RetrievedDocument:
     text: str
     score: float
     source_domain: Optional[str] = None
+    source_tier: Optional[str] = None  # SourceTier value (TIER_1, TIER_2, etc.)
     verdict: Optional[Verdict] = None
     fact_type: Optional[FactType] = None
-    valid_from: Optional[datetime] = None
-    valid_to: Optional[datetime] = None
+    explanation: Optional[str] = None
+    valid_from: Optional[str] = None  # ISO format string
+    valid_to: Optional[str] = None  # ISO format string
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Convert string values to enums if needed."""
+        if isinstance(self.verdict, str):
+            self.verdict = Verdict(self.verdict)
+        if isinstance(self.fact_type, str):
+            self.fact_type = FactType(self.fact_type)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,10 +109,12 @@ class RetrievedDocument:
             "text": self.text,
             "score": self.score,
             "source_domain": self.source_domain,
+            "source_tier": self.source_tier,
             "verdict": self.verdict.value if self.verdict else None,
             "fact_type": self.fact_type.value if self.fact_type else None,
-            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
-            "valid_to": self.valid_to.isoformat() if self.valid_to else None,
+            "explanation": self.explanation,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
             "metadata": self.metadata
         }
 
@@ -147,13 +158,17 @@ class Evidence:
     
     @property
     def best_sources(self) -> List[str]:
-        """Get the best source domains."""
+        """Get the best source URLs/domains for tier checking."""
         sources = []
         for doc in self.retrieved_docs:
             if doc.source_domain:
                 sources.append(doc.source_domain)
         for result in self.search_results:
-            sources.append(result.domain)
+            # Include URL if available for proper tier checking, otherwise domain
+            if result.url:
+                sources.append(result.url)
+            elif result.domain:
+                sources.append(result.domain)
         return list(set(sources))
     
     def to_dict(self) -> Dict[str, Any]:

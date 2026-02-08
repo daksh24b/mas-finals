@@ -29,12 +29,13 @@ from qdrant_client.http.models import (
 )
 
 from ..core.config import settings
+from ..core.state import Verdict, FactType
 from ..utils.logger import get_logger
 from .schema import (
     KnowledgeRecord,
     SearchResult,
     VerdictType,
-    FactType,
+    FactType as SchemaFactType,
     SourceTier,
     DENSE_VECTOR_NAME,
     SPARSE_VECTOR_NAME,
@@ -204,7 +205,7 @@ class QdrantManager:
         
         # Handle temporal versioning for transient facts
         if record.fact_type == FactType.TRANSIENT:
-            await self._expire_old_versions(record.text, record.claim_hash)
+            await self._expire_old_versions(record.text, record.content_hash)
         
         # Prepare point
         point = PointStruct(
@@ -308,8 +309,8 @@ class QdrantManager:
         
         Uses Reciprocal Rank Fusion (RRF) to combine results.
         """
-        # Generate query embeddings
-        dense_vector, sparse_vector = await self.embedding_service.embed_hybrid(query)
+        # Generate query embeddings (using RETRIEVAL_QUERY task type)
+        dense_vector, sparse_vector = await self.embedding_service.embed_hybrid_query(query)
         
         # Build filter
         filter_conditions = []
@@ -373,21 +374,24 @@ class QdrantManager:
         )
         
         # Convert to SearchResult objects
+        # Note: RRF scores are naturally small (0.01-0.02 range), so we don't
+        # apply score_threshold here. The pre-search thresholds already filtered.
         search_results = []
-        for point, score in fused_results[:limit]:
-            if score >= score_threshold:
-                search_results.append(SearchResult(
-                    id=str(point.id),
-                    text=point.payload.get("text", ""),
-                    score=score,
-                    verdict=VerdictType(point.payload.get("verdict", "UNCERTAIN")),
-                    fact_type=FactType(point.payload.get("fact_type", "STATIC")),
-                    source_domain=point.payload.get("source_domain"),
-                    source_tier=SourceTier(point.payload.get("source_tier", "TIER_5")),
-                    explanation=point.payload.get("explanation"),
-                    valid_from=point.payload.get("valid_from"),
-                    valid_to=point.payload.get("valid_to"),
-                ))
+        for point, rrf_score in fused_results[:limit]:
+            # Use the original dense score for the result (more interpretable)
+            original_score = point.score if point.score else rrf_score
+            search_results.append(SearchResult(
+                id=str(point.id),
+                text=point.payload.get("text", ""),
+                score=original_score,
+                verdict=VerdictType(point.payload.get("verdict", "UNCERTAIN")),
+                fact_type=FactType(point.payload.get("fact_type", "STATIC")),
+                source_domain=point.payload.get("source_domain"),
+                source_tier=SourceTier(point.payload.get("source_tier", "TIER_5")),
+                explanation=point.payload.get("explanation"),
+                valid_from=point.payload.get("valid_from"),
+                valid_to=point.payload.get("valid_to"),
+            ))
         
         logger.debug(f"Hybrid search returned {len(search_results)} results for: {query[:50]}...")
         return search_results
@@ -430,7 +434,7 @@ class QdrantManager:
         self,
         text: str,
         limit: int = 5,
-        threshold: float = 0.85,
+        threshold: float = 0.6,
     ) -> List[SearchResult]:
         """Find highly similar records (for deduplication)."""
         return await self.hybrid_search(
@@ -438,6 +442,44 @@ class QdrantManager:
             limit=limit,
             score_threshold=threshold,
         )
+    
+    async def check_duplicate(
+        self,
+        claim: str,
+        threshold: float = 0.9,
+    ) -> Optional[KnowledgeRecord]:
+        """
+        Check if a similar claim already exists in the knowledge base.
+        
+        Args:
+            claim: The claim text to check
+            threshold: Similarity threshold for duplicate detection
+            
+        Returns:
+            Existing KnowledgeRecord if duplicate found, None otherwise
+        """
+        try:
+            similar = await self.search_similar(
+                text=claim,
+                limit=1,
+                threshold=threshold,
+            )
+            
+            if similar and len(similar) > 0:
+                # Found a potential duplicate - convert RetrievedDocument to KnowledgeRecord
+                doc = similar[0]
+                return KnowledgeRecord(
+                    id=doc.id,
+                    text=doc.text,
+                    verdict=doc.verdict if doc.verdict else Verdict.PENDING,
+                    fact_type=doc.fact_type if doc.fact_type else FactType.STATIC,
+                    source_domain=doc.source_domain or "unknown",
+                    confidence=doc.score,
+                )
+            return None
+        except Exception as e:
+            logger.debug(f"Duplicate check failed: {e}")
+            return None
     
     async def get_by_id(self, record_id: str) -> Optional[KnowledgeRecord]:
         """Retrieve a specific record by ID."""

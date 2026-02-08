@@ -54,7 +54,7 @@ class Config(BaseSettings):
         description="Google dense embedding model"
     )
     dense_embedding_dim: int = Field(
-        default=768,
+        default=3072,
         description="Dense embedding vector dimension"
     )
     sparse_embedding_model: str = Field(
@@ -112,7 +112,7 @@ class Config(BaseSettings):
         description="Enable writing to knowledge base"
     )
     min_source_tier_for_memory: int = Field(
-        default=2,
+        default=4,
         description="Minimum source tier required for memory write (1=highest)"
     )
     

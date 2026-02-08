@@ -119,17 +119,23 @@ class TruthGuardianGraph:
             "critic",
             self._route_from_critic,
             {
-                "archivist": "archivist",
+                "respond": "respond",  # Go to respond first (user sees result faster)
                 "planner": "planner",  # Feedback loop (max 3)
-                "respond": "respond"
             }
         )
         
-        # Archivist goes to response
-        graph.add_edge("archivist", "respond")
+        # Response routes to archivist for memorization or ends
+        graph.add_conditional_edges(
+            "respond",
+            self._route_from_respond,
+            {
+                "archivist": "archivist",
+                "end": END
+            }
+        )
         
-        # Response ends the graph
-        graph.add_edge("respond", END)
+        # Archivist ends the graph
+        graph.add_edge("archivist", END)
         
         return graph
     
@@ -256,14 +262,35 @@ class TruthGuardianGraph:
                 )
                 return "respond"
         
-        # If verdict is conclusive, go to archivist
+        # Always go to respond first (user sees result faster)
+        # Archivist runs after response
+        logger.with_agent("Graph").info(f"Verdict {verdict} -> respond")
+        return "respond"
+    
+    def _route_from_respond(
+        self,
+        state: AgentState
+    ) -> Literal["archivist", "end"]:
+        """Route from Respond to optionally archive the result.
+        
+        Only archive if verdict is conclusive (TRUE or FALSE).
+        """
+        verdict = state.get("verdict", "PENDING")
+        intent = state.get("intent", "")
+        
+        # Skip archiving for non-informational intents
+        if intent in [Intent.CONVERSATIONAL.value, Intent.OUT_OF_SCOPE.value]:
+            logger.with_agent("Graph").info("Non-informational intent -> end")
+            return "end"
+        
+        # Archive conclusive verdicts
         if verdict in [Verdict.TRUE.value, Verdict.FALSE.value]:
-            logger.with_agent("Graph").info(f"Verdict {verdict} -> archivist")
+            logger.with_agent("Graph").info(f"Verdict {verdict} -> archivist (background)")
             return "archivist"
         
-        # Uncertain verdict, skip archiving
-        logger.with_agent("Graph").info("Uncertain verdict -> respond")
-        return "respond"
+        # Uncertain/pending verdicts, skip archiving
+        logger.with_agent("Graph").info("Uncertain verdict -> end (skip archiving)")
+        return "end"
     
     # ==================== Response Generation ====================
     

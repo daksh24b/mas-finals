@@ -138,7 +138,7 @@ class EmbeddingService:
     
     async def embed_hybrid(self, text: str) -> Tuple[List[float], Dict[str, Any]]:
         """
-        Generate both dense and sparse embeddings.
+        Generate both dense and sparse embeddings for DOCUMENTS (storage).
         
         Args:
             text: Text to embed
@@ -148,6 +148,28 @@ class EmbeddingService:
         """
         # Run both in parallel
         dense_task = self.embed_dense(text)
+        sparse_task = self.embed_sparse(text)
+        
+        dense_vector, sparse_vector = await asyncio.gather(
+            dense_task, sparse_task
+        )
+        
+        return dense_vector, sparse_vector
+    
+    async def embed_hybrid_query(self, text: str) -> Tuple[List[float], Dict[str, Any]]:
+        """
+        Generate both dense and sparse embeddings for QUERIES (search).
+        
+        Uses RETRIEVAL_QUERY task type for dense embeddings.
+        
+        Args:
+            text: Query text to embed
+            
+        Returns:
+            Tuple of (dense_vector, sparse_vector)
+        """
+        # Run both in parallel
+        dense_task = self.embed_dense_query(text)
         sparse_task = self.embed_sparse(text)
         
         dense_vector, sparse_vector = await asyncio.gather(

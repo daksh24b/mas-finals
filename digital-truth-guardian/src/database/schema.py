@@ -33,7 +33,7 @@ class SourceTier(str, Enum):
 
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
-DENSE_VECTOR_SIZE = 768  # Google text-embedding-004
+DENSE_VECTOR_SIZE = 3072  # Google gemini-embedding-001
 
 
 # ==================== Data Classes ====================
@@ -157,7 +157,7 @@ class CollectionSchema:
     Configures vectors, indexes, and optimization settings.
     """
     name: str
-    dense_vector_size: int = 768
+    dense_vector_size: int = 3072
     dense_distance: str = "Cosine"
     enable_sparse: bool = True
     
@@ -395,7 +395,7 @@ class SharedContextRecord:
 
 KNOWLEDGE_BASE_SCHEMA = CollectionSchema(
     name="knowledge_base",
-    dense_vector_size=768,  # Google text-embedding-004 dimension
+    dense_vector_size=3072,  # Google gemini-embedding-001 dimension
     dense_distance="Cosine",
     enable_sparse=True,
     on_disk_payload=True,
@@ -409,7 +409,7 @@ KNOWLEDGE_BASE_SCHEMA = CollectionSchema(
 # Episodic Memory: Stores past agent interactions and decisions
 EPISODIC_MEMORY_SCHEMA = CollectionSchema(
     name="episodic_memory",
-    dense_vector_size=768,
+    dense_vector_size=3072,
     dense_distance="Cosine",
     enable_sparse=False,  # Semantic search only for episodes
     on_disk_payload=True,
@@ -423,7 +423,7 @@ EPISODIC_MEMORY_SCHEMA = CollectionSchema(
 # Shared Agent Context: For inter-agent communication and coordination
 SHARED_CONTEXT_SCHEMA = CollectionSchema(
     name="shared_context",
-    dense_vector_size=768,
+    dense_vector_size=3072,
     dense_distance="Cosine",
     enable_sparse=False,
     on_disk_payload=True,
